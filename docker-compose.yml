@@ -1,0 +1,173 @@
+version: "3"
+
+services:
+  db:
+    image: mariadb:10.6
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MARIADB_ROOT_PASSWORD: admin
+    volumes:
+      - db-data:/var/lib/mysql
+    networks:
+      - frappe_network
+
+  redis-cache:
+    image: redis:6.2-alpine
+    volumes:
+      - redis-cache-data:/data
+    networks:
+      - frappe_network
+
+  redis-queue:
+    image: redis:6.2-alpine
+    volumes:
+      - redis-queue-data:/data
+    networks:
+      - frappe_network
+
+  backend:
+    image: frappe/erpnext:v15.89.0
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      MYSQL_ROOT_PASSWORD: admin
+      MARIADB_ROOT_PASSWORD: admin
+    depends_on:
+      - db
+      - redis-cache
+      - redis-queue
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - frappe_network
+
+  configurator:
+    image: frappe/erpnext:v15.89.0
+    entrypoint: bash -c "
+      ls -1 apps > sites/apps.txt &&
+      bench set-config -g db_host db &&
+      bench set-config -gp db_port 3306 &&
+      bench set-config -g redis_cache redis://redis-cache:6379 &&
+      bench set-config -g redis_queue redis://redis-queue:6379 &&
+      bench set-config -g redis_socketio redis://redis-queue:6379 &&
+      bench set-config -gp socketio_port 9000
+    "
+    depends_on:
+      - backend
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - frappe_network
+
+  create-site:
+    image: frappe/erpnext:v15.89.0
+    entrypoint: bash -c "
+      wait-for-it -t 60 db:3306;
+      wait-for-it -t 60 redis-cache:6379;
+      wait-for-it -t 60 redis-queue:6379;
+      bench new-site --mariadb-user-host-login-scope='%' \
+        --admin-password=admin \
+        --db-root-username=root \
+        --db-root-password=admin \
+        --install-app erpnext \
+        --set-default erp.alexrenovation.net
+    "
+    depends_on:
+      - db
+      - redis-cache
+      - redis-queue
+      - configurator
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - frappe_network
+
+  websocket:
+    image: frappe/erpnext:v15.89.0
+    command: node /home/frappe/frappe-bench/apps/frappe/socketio.js
+    depends_on:
+      - backend
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - frappe_network
+
+  scheduler:
+    image: frappe/erpnext:v15.89.0
+    command: bench schedule
+    depends_on:
+      - backend
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - frappe_network
+
+  queue-long:
+    image: frappe/erpnext:v15.89.0
+    command: bench worker --queue long,default,short
+    depends_on:
+      - backend
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - frappe_network
+
+  queue-short:
+    image: frappe/erpnext:v15.89.0
+    command: bench worker --queue short,default
+    depends_on:
+      - backend
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - frappe_network
+
+  frontend:
+    image: frappe/erpnext:v15.89.0
+    command: nginx-entrypoint.sh
+    depends_on:
+      - websocket
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: erp.alexrenovation.net
+      SERVICE_FQDN_FRONTEND_8080: erp.alexrenovation.net
+      CLIENT_MAX_BODY_SIZE: 50m
+      PROXY_READ_TIMEOUT: 120
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - frappe_network
+
+volumes:
+  db-data:
+  redis-cache-data:
+  redis-queue-data:
+  sites:
+  logs:
+
+networks:
+  frappe_network:
+    driver: bridge
